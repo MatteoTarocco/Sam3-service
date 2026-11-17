@@ -8,9 +8,12 @@ from typing import Generator
 
 from app.core.config import settings
 
+# SQLAlchemy 2.1 defaults "postgresql://" to psycopg (v3); we ship psycopg2.
 _url = settings.DATABASE_URL
-if _url.startswith("postgres://"):
-    _url = _url.replace("postgres://", "postgresql://", 1)
+for _prefix in ("postgres://", "postgresql://"):
+    if _url.startswith(_prefix):
+        _url = "postgresql+psycopg2://" + _url[len(_prefix):]
+        break
 
 engine = create_engine(
     _url,
