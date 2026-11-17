@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     # Max uploaded image size in MB
     MAX_IMAGE_SIZE_MB: int = 20
 
+    # Images whose longest side exceeds this are downscaled before inference
+    # (bboxes / mask areas are rescaled to the original size). 0 disables.
+    INFERENCE_MAX_SIDE: int = 1280
+
+    # PyTorch intra-op threads. 0 = auto-detect from the container CPU quota.
+    TORCH_NUM_THREADS: int = 0
+
     # ── Logging ───────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

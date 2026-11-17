@@ -134,6 +134,7 @@ async def segment_image(
     )
 
     image = await _load_image(body.image)
+    t_loaded = time.perf_counter()
 
     try:
         segmenter = get_segmenter()
@@ -163,12 +164,17 @@ async def segment_image(
         for d in raw_detections
     ]
 
-    processing_time = round(time.perf_counter() - t0, 3)
+    t_done = time.perf_counter()
+    processing_time = round(t_done - t0, 3)
     logger.info(
-        "Segment done — user='%s'  found=%d  time=%.3fs",
+        "Segment done — user='%s'  found=%d  time=%.3fs  (image load=%.3fs  inference=%.3fs  size=%dx%d)",
         current_user.username,
         len(detections),
         processing_time,
+        t_loaded - t0,
+        t_done - t_loaded,
+        image.width,
+        image.height,
     )
 
     return SegmentResponse(

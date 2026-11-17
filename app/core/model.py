@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import os
 import queue as _queue
 import threading
 import time
@@ -87,6 +88,55 @@ def _reject(future: asyncio.Future, exc: BaseException) -> None:
     """Set exception on a Future that may already be cancelled — safe no-op."""
     if not future.done():
         future.set_exception(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CPU threading
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _container_cpu_quota() -> Optional[int]:
+    """vCPUs granted by the cgroup CPU quota, or None if unlimited / unknown."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        if quota != "max":
+            return max(1, int(int(quota) / int(period)))
+    except Exception:
+        pass
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        if quota > 0:
+            return max(1, quota // period)
+    except Exception:
+        pass
+    return None
+
+
+def configure_torch_threads() -> None:
+    """
+    Pin PyTorch's intra-op thread pool to the CPUs actually available.
+
+    Inside a container os.cpu_count() reports the *host* cores, so PyTorch
+    may spawn far more threads than the CPU quota allows, which causes CFS
+    throttling and slows every forward pass.
+    """
+    import torch  # noqa: PLC0415
+
+    before = torch.get_num_threads()
+    n = settings.TORCH_NUM_THREADS
+    if n <= 0:
+        affinity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+        quota = _container_cpu_quota()
+        n = min(affinity, quota) if quota else affinity
+    torch.set_num_threads(n)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # can only be set before any parallel work has started
+    logger.info(
+        "PyTorch threads: %d (default was %d, os.cpu_count=%s, cgroup quota=%s)",
+        n, before, os.cpu_count(), _container_cpu_quota(),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,7 +355,16 @@ class SAM3Segmenter:
             verbose=False,
             save=False,
         )
-        self._predictor = SAM3SemanticPredictor(overrides=overrides)
+        predictor = SAM3SemanticPredictor(overrides=overrides)
+
+        # Ultralytics builds the network lazily on the first set_image() call,
+        # which otherwise adds ~10 s to the first real request.
+        t0 = time.perf_counter()
+        predictor.set_image(Image.new("RGB", (640, 640)))
+        predictor(text=["car"])
+        logger.info("SAM3 warm-up inference done in %.1fs.", time.perf_counter() - t0)
+
+        self._predictor = predictor
         self._last_used = time.monotonic()
         logger.info("SAM3 loaded successfully.")
 
@@ -370,7 +429,22 @@ class SAM3Segmenter:
 
         The `text` parameter takes a list of noun-phrase strings; class indices
         in the results map back to positions in that list.
+
+        Large images are downscaled first: the model input is ~644 px anyway,
+        but masks are upsampled to the input resolution, which dominates
+        post-processing time on multi-megapixel photos.
         """
+        orig_w, orig_h = image.size
+        max_side = settings.INFERENCE_MAX_SIDE
+        if max_side > 0 and max(orig_w, orig_h) > max_side:
+            ratio = max_side / max(orig_w, orig_h)
+            image = image.resize(
+                (max(1, round(orig_w * ratio)), max(1, round(orig_h * ratio))),
+                Image.BILINEAR,
+            )
+        sx = orig_w / image.size[0]
+        sy = orig_h / image.size[1]
+
         predictor.set_image(image)
         results = predictor(text=classes)
 
@@ -385,7 +459,8 @@ class SAM3Segmenter:
             for i in range(len(result.boxes)):
                 cls_id     = int(result.boxes.cls[i].item())
                 confidence = float(result.boxes.conf[i].item())
-                bbox       = result.boxes.xyxy[i].cpu().numpy().tolist()
+                x1, y1, x2, y2 = result.boxes.xyxy[i].cpu().numpy().tolist()
+                bbox       = [x1 * sx, y1 * sy, x2 * sx, y2 * sy]
 
                 # SAM3SemanticPredictor returns names as a list; standard YOLO
                 # models return a dict ({0: "car"}).  Handle both.
@@ -403,7 +478,7 @@ class SAM3Segmenter:
 
                 mask_area: Optional[int] = None
                 if result.masks is not None and i < len(result.masks.data):
-                    mask_area = int(result.masks.data[i].sum().item())
+                    mask_area = round(result.masks.data[i].sum().item() * sx * sy)
 
                 detections.append(
                     Detection(
@@ -441,6 +516,7 @@ def init_segmenter() -> SAM3Segmenter:
     """
     global _segmenter
     download_model_from_s3()
+    configure_torch_threads()
     segmenter = SAM3Segmenter(settings.MODEL_LOCAL_PATH)
     segmenter.load()   # load weights synchronously before worker starts
     segmenter.start()  # worker now owns the predictor for all future requests
