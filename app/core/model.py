@@ -67,6 +67,7 @@ class Detection:
 # Sentinel objects placed on the queue to signal control actions.
 _STOP   = object()  # shut down the worker thread
 _UNLOAD = object()  # unload the model from RAM
+_LOAD   = object()  # load + warm up the model in the background
 
 
 @dataclass
@@ -228,8 +229,10 @@ class SAM3Segmenter:
     Lifecycle
     ─────────
     1. download_model_from_s3() / init_segmenter()  — before any requests
-    2. load()   — loads weights into RAM (called in main thread at startup)
-    3. start()  — starts the worker thread (called right after load())
+    2. start()  — starts the worker thread
+    3. preload() — worker loads + warms up the model in the background, so
+                   the server accepts connections immediately after a wake
+                   from sleep; early requests queue behind the warm-up
     4. [requests flow through segment()]
     5. stop()   — sends stop sentinel; called at app shutdown
     """
@@ -288,6 +291,10 @@ class SAM3Segmenter:
             self._worker.join(timeout=5)
             self._worker = None
 
+    def preload(self) -> None:
+        """Schedule a background load + warm-up on the worker thread. Non-blocking."""
+        self._queue.put(_LOAD)
+
     def unload(self) -> None:
         """
         Schedule a model unload via the worker thread.
@@ -322,6 +329,14 @@ class SAM3Segmenter:
             if job is _UNLOAD:
                 if self._predictor is not None:
                     self._do_unload()
+                continue
+
+            if job is _LOAD:
+                if self._predictor is None:
+                    try:
+                        self._load()
+                    except Exception as exc:
+                        logger.error("SAM3 worker: background load failed: %s", exc, exc_info=True)
                 continue
 
             # Inference job
@@ -508,17 +523,17 @@ def get_segmenter() -> SAM3Segmenter:
 
 def init_segmenter() -> SAM3Segmenter:
     """
-    Download model from S3 (if not cached locally), load into RAM, start the
-    worker thread, and register the singleton.
+    Download model from S3 (if not cached locally), start the worker thread,
+    schedule a background load + warm-up, and register the singleton.
 
     Called once during app lifespan startup.
-    Startup sequence: download → load (main thread) → start worker thread.
+    Startup sequence: download → start worker thread → background load.
     """
     global _segmenter
     download_model_from_s3()
     configure_torch_threads()
     segmenter = SAM3Segmenter(settings.MODEL_LOCAL_PATH)
-    segmenter.load()   # load weights synchronously before worker starts
-    segmenter.start()  # worker now owns the predictor for all future requests
+    segmenter.start()    # worker owns the predictor for all requests
+    segmenter.preload()  # load + warm-up runs on the worker; server starts listening now
     _segmenter = segmenter
     return _segmenter

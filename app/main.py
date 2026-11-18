@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
 
     try:
         segmenter = init_segmenter()
-        logger.info("SAM3 model ready.")
+        logger.info("SAM3 worker started; model loading in background.")
     except Exception as exc:
         # Log but do NOT crash — Railway will restart after the healthcheck fails.
         logger.error("Model initialization failed: %s", exc, exc_info=True)
